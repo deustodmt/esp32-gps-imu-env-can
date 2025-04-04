@@ -1,41 +1,133 @@
 #include <Arduino.h>
-#include <TinyGPS++.h>
 #include <HardwareSerial.h>
+#include <TinyGPS++.h>
+#include "M5UnitENV.h"
+#include "MPU6886.h"
 
-// Crear el objeto GPS
-TinyGPSPlus gps;
+// Configuración GPS
+#define GPS_RX_PIN 18
+#define GPS_TX_PIN 17
+#define GPS_BAUDRATE 9600
+HardwareSerial gpsSerial(1);
+TinyGPSPlus gps;  // Objeto para procesar datos GPS
 
-// Configurar el puerto serial del ESP32 para la comunicación con el GPS
-HardwareSerial mySerial(1);
+// Configuración I2C
+#define I2C_SDA 8
+#define I2C_SCL 9
+
+// Objetos sensores
+SHT3X sht3x;
+QMP6988 qmp;
+MPU6886 imu;
+
+void setupSensors() {
+  if (!qmp.begin(&Wire, QMP6988_SLAVE_ADDRESS_L, I2C_SDA, I2C_SCL, 400000U)) {
+    Serial.println("Couldn't find QMP6988");
+    while (1) delay(1);
+  }
+
+  if (!sht3x.begin(&Wire, SHT3X_I2C_ADDR, I2C_SDA, I2C_SCL, 400000U)) {
+    Serial.println("Couldn't find SHT3X");
+    while (1) delay(1);
+  }
+}
+
+void printEnvSensorData() {
+  if (sht3x.update()) {
+    Serial.println("\n-----SHT3X-----");
+    Serial.print("Temperature: ");
+    Serial.print(sht3x.cTemp);
+    Serial.println(" °C");
+    Serial.print("Humidity: ");
+    Serial.print(sht3x.humidity);
+    Serial.println("% rH");
+  }
+
+  if (qmp.update()) {
+    Serial.println("\n-----QMP6988-----");
+    Serial.print("Temperature: ");
+    Serial.print(qmp.cTemp);
+    Serial.println(" °C");
+    Serial.print("Pressure: ");
+    Serial.print(qmp.pressure);
+    Serial.println(" Pa");
+  }
+}
+
+void printGPSData() {
+  Serial.println("\n-----GPS-----");
+  
+  if (gps.location.isValid()) {
+    Serial.print("Latitude: ");
+    Serial.print(gps.location.lat(), 6);
+    Serial.print("° ");
+    Serial.print(gps.location.rawLat().negative ? "S" : "N");
+    
+    Serial.print("\nLongitude: ");
+    Serial.print(gps.location.lng(), 6);
+    Serial.print("° ");
+    Serial.print(gps.location.rawLng().negative ? "W" : "E");
+    
+    Serial.print("\nSatellites: ");
+    Serial.println(gps.satellites.value());
+    
+    Serial.print("Altitude: ");
+    Serial.print(gps.altitude.meters());
+    Serial.println(" m");
+    
+    Serial.print("Speed: ");
+    Serial.print(gps.speed.kmph());
+    Serial.println(" km/h");
+    
+    Serial.print("Date: ");
+    Serial.print(gps.date.day());
+    Serial.print("/");
+    Serial.print(gps.date.month());
+    Serial.print("/");
+    Serial.println(gps.date.year());
+    
+    Serial.print("Time: ");
+    Serial.print(gps.time.hour());
+    Serial.print(":");
+    Serial.print(gps.time.minute());
+    Serial.print(":");
+    Serial.println(gps.time.second());
+  } else {
+    Serial.println("Waiting for GPS fix...");
+    Serial.print("Satellites in view: ");
+    Serial.println(gps.satellites.value());
+  }
+}
 
 void setup() {
-  // Inicializar la comunicación serial con el monitor
-  Serial.begin(9600);  // Configura el baud rate aquí
+  Serial.begin(9600);
+  while (!Serial);
 
-  Serial.println("Empezando conexion serial con el GPS...");
-  // Inicializar el puerto serial para el GPS en los pines 17 y 18
-  mySerial.begin(9600, SERIAL_8N1, 17, 18);
-  
-  Serial.println("Iniciando GPS...");
+  // Inicializar GPS
+  gpsSerial.begin(GPS_BAUDRATE, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  Serial.println("GPS inicializado");
+
+  // Inicializar sensores I2C
+  setupSensors();
 }
 
 void loop() {
-  // Leer los datos del GPS y pasarlos al objeto TinyGPS++
-  while (mySerial.available() > 0) {
-    gps.encode(mySerial.read());
-    Serial.println("Leyendo datos...");
+  // Leer datos del GPS
+  while (gpsSerial.available() > 0) {
+    if (gps.encode(gpsSerial.read())) {
+      // Se procesó un nuevo dato GPS
+      printGPSData();
+    }
   }
-  
-  // Comprobar si hay nuevos datos de GPS disponibles
-  if (gps.location.isUpdated()) {
-    Serial.print("Latitud= "); 
-    Serial.print(gps.location.lat(), 6); 
-    Serial.print(" Longitud= "); 
-    Serial.println(gps.location.lng(), 6); 
+
+  // Leer y mostrar datos de sensores ambientales
+  printEnvSensorData();
+
+  // Si no hay datos GPS por mucho tiempo, mostrar advertencia
+  if (millis() > 5000 && gps.charsProcessed() < 10) {
+    Serial.println("No se detectan datos GPS. Verificar conexiones.");
+    while(true); // Detener ejecución
   }
-  else {
-    Serial.println("No data");
-  }
-  
-  delay(1000);  // Esperar un segundo
+
+  delay(1000); // Esperar 1 segundo entre lecturas
 }
