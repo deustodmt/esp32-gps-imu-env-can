@@ -9,7 +9,7 @@
 #define GPS_TX_PIN 17
 #define GPS_BAUDRATE 9600
 HardwareSerial gpsSerial(1);
-TinyGPSPlus gps;  // Objeto para procesar datos GPS
+TinyGPSPlus gps;
 
 // Configuración I2C
 #define I2C_SDA 8
@@ -20,16 +20,101 @@ SHT3X sht3x;
 QMP6988 qmp;
 MPU6886 imu;
 
+// Variables para calibración IMU
+float accelBias[3] = {0, 0, 0};
+float gyroBias[3] = {0, 0, 0};
+const uint16_t calibrationSamples = 500;
+
+void calibrateIMU() {
+  Serial.println("Calibrando IMU (mantener estable)...");
+  
+  float accelSum[3] = {0, 0, 0};
+  float gyroSum[3] = {0, 0, 0};
+  
+  for(uint16_t i=0; i<calibrationSamples; i++) {
+    float acc[3], gyro[3];
+    imu.getAccelData(&acc[0], &acc[1], &acc[2]);
+    imu.getGyroData(&gyro[0], &gyro[1], &gyro[2]);
+    
+    for(int j=0; j<3; j++) {
+      accelSum[j] += acc[j];
+      gyroSum[j] += gyro[j];
+    }
+    delay(10);
+  }
+  
+  // Calcular bias
+  for(int i=0; i<3; i++) {
+    accelBias[i] = accelSum[i]/calibrationSamples;
+    if(i==2) accelBias[i] -= 1.0; // Compensar gravedad en Z
+    gyroBias[i] = gyroSum[i]/calibrationSamples;
+  }
+  
+  Serial.println("Calibración IMU completada");
+}
+
 void setupSensors() {
+  // Inicializar QMP6988
   if (!qmp.begin(&Wire, QMP6988_SLAVE_ADDRESS_L, I2C_SDA, I2C_SCL, 400000U)) {
     Serial.println("Couldn't find QMP6988");
     while (1) delay(1);
   }
 
+  // Inicializar SHT3X
   if (!sht3x.begin(&Wire, SHT3X_I2C_ADDR, I2C_SDA, I2C_SCL, 400000U)) {
     Serial.println("Couldn't find SHT3X");
     while (1) delay(1);
   }
+
+  // Inicializar MPU6886
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(400000);
+  if (imu.Init()) {
+    Serial.println("Couldn't find MPU6886");
+    while (1) delay(1);
+  }
+  
+  // Configurar rangos
+  imu.setAccelFsr(MPU6886::AFS_4G);
+  imu.setGyroFsr(MPU6886::GFS_500DPS);
+  
+  // Calibrar IMU
+  calibrateIMU();
+}
+
+void printIMUData() {
+  float acc[3], gyro[3], temp;
+  
+  // Leer datos con corrección de bias
+  imu.getAccelData(&acc[0], &acc[1], &acc[2]);
+  imu.getGyroData(&gyro[0], &gyro[1], &gyro[2]);
+  imu.getTempData(&temp);
+
+  // Aplicar calibración
+  for(int i=0; i<3; i++) {
+    acc[i] -= accelBias[i];
+    gyro[i] -= gyroBias[i];
+  }
+
+  // Mostrar datos
+  Serial.println("\n-----MPU6886-----");
+  Serial.print("Acelerómetro (g): X=");
+  Serial.print(acc[0], 2);
+  Serial.print(" Y=");
+  Serial.print(acc[1], 2);
+  Serial.print(" Z=");
+  Serial.println(acc[2], 2);
+  
+  Serial.print("Giroscopio (°/s): X=");
+  Serial.print(gyro[0], 1);
+  Serial.print(" Y=");
+  Serial.print(gyro[1], 1);
+  Serial.print(" Z=");
+  Serial.println(gyro[2], 1);
+  
+  Serial.print("Temperatura IMU: ");
+  Serial.print(temp, 1);
+  Serial.println(" °C");
 }
 
 void printEnvSensorData() {
@@ -107,27 +192,34 @@ void setup() {
   gpsSerial.begin(GPS_BAUDRATE, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
   Serial.println("GPS inicializado");
 
-  // Inicializar sensores I2C
+  // Inicializar todos los sensores
   setupSensors();
 }
 
 void loop() {
-  // Leer datos del GPS
+  static uint32_t lastEnvUpdate = 0;
+  static uint32_t lastIMUUpdate = 0;
+  
+  // Procesar datos GPS continuamente
   while (gpsSerial.available() > 0) {
-    if (gps.encode(gpsSerial.read())) {
-      // Se procesó un nuevo dato GPS
-      printGPSData();
-    }
+    gps.encode(gpsSerial.read());
   }
 
-  // Leer y mostrar datos de sensores ambientales
-  printEnvSensorData();
+  // Actualizar sensores ambientales cada segundo
+  if (millis() - lastEnvUpdate >= 1000) {
+    printGPSData();
+    printEnvSensorData();
+    lastEnvUpdate = millis();
+  }
 
-  // Si no hay datos GPS por mucho tiempo, mostrar advertencia
+  // Actualizar IMU más frecuentemente (10Hz)
+  if (millis() - lastIMUUpdate >= 100) {
+    printIMUData();
+    lastIMUUpdate = millis();
+  }
+
+  // Verificar fallo GPS
   if (millis() > 5000 && gps.charsProcessed() < 10) {
     Serial.println("No se detectan datos GPS. Verificar conexiones.");
-    while(true); // Detener ejecución
   }
-
-  delay(1000); // Esperar 1 segundo entre lecturas
 }
