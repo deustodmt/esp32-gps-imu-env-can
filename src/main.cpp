@@ -3,6 +3,13 @@
 #include <TinyGPS++.h>
 #include "M5UnitENV.h"
 #include "MPU6886.h"
+#include <CAN_config.h>
+#include <ESP32CAN.h>
+
+// Configuración CAN
+#define CAN_TX_PIN 5
+#define CAN_RX_PIN 4
+CAN_device_t CAN_cfg; // Configuración CAN
 
 // Configuración GPS
 #define GPS_RX_PIN 18
@@ -24,6 +31,86 @@ MPU6886 imu;
 float accelBias[3] = {0, 0, 0};
 float gyroBias[3] = {0, 0, 0};
 const uint16_t calibrationSamples = 500;
+
+// Estructura para datos CAN
+typedef struct {
+  float latitude;
+  float longitude;
+  float altitude;
+  float speed;
+  float temperature;
+  float humidity;
+  float pressure;
+  float accel[3];
+  float gyro[3];
+  uint8_t satellites;
+} SensorData_t;
+
+void setupCAN() {
+  CAN_cfg.speed = CAN_SPEED_125KBPS;
+  CAN_cfg.tx_pin_id = (gpio_num_t)CAN_TX_PIN;
+  CAN_cfg.rx_pin_id = (gpio_num_t)CAN_RX_PIN;
+  CAN_cfg.rx_queue = xQueueCreate(10, sizeof(CAN_frame_t));
+  
+  // Inicializar CAN
+  if (ESP32Can.CANInit() == 0)
+    Serial.println("CAN inicializado");
+  else
+    Serial.println("ERROR al inicializar CAN");
+}
+
+void sendCANData(const SensorData_t& data) {
+  CAN_frame_t tx_frame;
+  tx_frame.FIR.B.FF = CAN_frame_std;
+  tx_frame.MsgID = 0x123; // ID del mensaje (puedes cambiarlo)
+  tx_frame.FIR.B.DLC = 8; // Longitud de datos (máximo 8 bytes por frame)
+  
+  // Enviamos los datos en múltiples frames si es necesario
+  // Frame 1: Posición (latitud y longitud)
+  memcpy(tx_frame.data.u8, &data.latitude, 4);
+  memcpy(tx_frame.data.u8 + 4, &data.longitude, 4);
+  Serial.println("hasta aqui llega");
+  ESP32Can.CANWriteFrame(&tx_frame);
+  Serial.println("aqui no");
+  delay(10);
+  
+  // Frame 2: Altitud y velocidad
+  memcpy(tx_frame.data.u8, &data.altitude, 4);
+  memcpy(tx_frame.data.u8 + 4, &data.speed, 4);
+  ESP32Can.CANWriteFrame(&tx_frame);
+  delay(10);
+  
+  // Frame 3: Datos ambientales
+  memcpy(tx_frame.data.u8, &data.temperature, 4);
+  memcpy(tx_frame.data.u8 + 4, &data.humidity, 4);
+  ESP32Can.CANWriteFrame(&tx_frame);
+  delay(10);
+  
+  // Frame 4: Presión y satélites
+  memcpy(tx_frame.data.u8, &data.pressure, 4);
+  tx_frame.data.u8[4] = data.satellites;
+  ESP32Can.CANWriteFrame(&tx_frame);
+  delay(10);
+  
+  // Frame 5: Acelerómetro (X e Y)
+  memcpy(tx_frame.data.u8, &data.accel[0], 4);
+  memcpy(tx_frame.data.u8 + 4, &data.accel[1], 4);
+  ESP32Can.CANWriteFrame(&tx_frame);
+  delay(10);
+  
+  // Frame 6: Acelerómetro (Z) y Giroscopio (X)
+  memcpy(tx_frame.data.u8, &data.accel[2], 4);
+  memcpy(tx_frame.data.u8 + 4, &data.gyro[0], 4);
+  ESP32Can.CANWriteFrame(&tx_frame);
+  delay(10);
+  
+  // Frame 7: Giroscopio (Y y Z)
+  memcpy(tx_frame.data.u8, &data.gyro[1], 4);
+  memcpy(tx_frame.data.u8 + 4, &data.gyro[2], 4);
+  ESP32Can.CANWriteFrame(&tx_frame);
+  
+  Serial.println("Datos enviados por CAN");
+}
 
 void calibrateIMU() {
   Serial.println("Calibrando IMU (mantener estable)...");
@@ -80,6 +167,36 @@ void setupSensors() {
   
   // Calibrar IMU
   calibrateIMU();
+}
+
+void readSensors(SensorData_t& data) {
+  // Leer datos GPS
+  data.latitude = gps.location.isValid() ? gps.location.lat() : 0.0;
+  data.longitude = gps.location.isValid() ? gps.location.lng() : 0.0;
+  data.altitude = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
+  data.speed = gps.speed.isValid() ? gps.speed.kmph() : 0.0;
+  data.satellites = gps.satellites.isValid() ? gps.satellites.value() : 0;
+  
+  // Leer datos ambientales
+  if (sht3x.update()) {
+    data.temperature = sht3x.cTemp;
+    data.humidity = sht3x.humidity;
+  }
+  
+  if (qmp.update()) {
+    data.pressure = qmp.pressure;
+  }
+  
+  // Leer datos IMU
+  float acc[3], gyro[3];
+  imu.getAccelData(&acc[0], &acc[1], &acc[2]);
+  imu.getGyroData(&gyro[0], &gyro[1], &gyro[2]);
+  
+  // Aplicar calibración
+  for(int i=0; i<3; i++) {
+    data.accel[i] = acc[i] - accelBias[i];
+    data.gyro[i] = gyro[i] - gyroBias[i];
+  }
 }
 
 void printIMUData() {
@@ -188,6 +305,9 @@ void setup() {
   Serial.begin(9600);
   while (!Serial);
 
+  // Inicializar CAN
+  setupCAN();
+
   // Inicializar GPS
   gpsSerial.begin(GPS_BAUDRATE, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
   Serial.println("GPS inicializado");
@@ -199,6 +319,7 @@ void setup() {
 void loop() {
   static uint32_t lastEnvUpdate = 0;
   static uint32_t lastIMUUpdate = 0;
+  static uint32_t lastCANUpdate = 0;
   
   // Procesar datos GPS continuamente
   while (gpsSerial.available() > 0) {
@@ -216,6 +337,14 @@ void loop() {
   if (millis() - lastIMUUpdate >= 100) {
     printIMUData();
     lastIMUUpdate = millis();
+  }
+
+  // Enviar datos por CAN cada 2 segundos
+  if (millis() - lastCANUpdate >= 2000) {
+    SensorData_t sensorData;
+    readSensors(sensorData);
+    sendCANData(sensorData);
+    lastCANUpdate = millis();
   }
 
   // Verificar fallo GPS
